@@ -12,6 +12,7 @@ from google.adk.agents import llm_agent
 from google.adk import runners
 from google.adk.plugins import base_plugin
 
+from core.config import DEMO_SECRETS
 from core.utils import chat_with_agent
 
 
@@ -27,6 +28,33 @@ from core.utils import chat_with_agent
 # - "redacted": cleaned response (PII replaced with [REDACTED])
 # ============================================================
 
+REDACTED = "[REDACTED]"
+
+# (tên issue, regex, chuỗi thay thế) — chạy theo đúng thứ tự trong list.
+PII_PATTERNS = [
+    # API key kiểu OpenAI / VinBank: sk-xxxx (≥6 ký tự sau "sk-")
+    ("api_key", re.compile(r"\bsk-[A-Za-z0-9_-]{6,}"), REDACTED),
+    # Password: giữ nhãn "password is" / "password=", chỉ che giá trị.
+    # Bắt cả "is", ":", "=" và tiếng Việt "mật khẩu"/"mat khau".
+    (
+        "password",
+        re.compile(
+            r"\b((?:password|passwd|pwd|mật khẩu|mat khau)\s*(?:is|là|la|[:=])\s*)[^\s,;]+",
+            re.IGNORECASE,
+        ),
+        r"\1" + REDACTED,
+    ),
+    # Email
+    ("email", re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}"), REDACTED),
+    # CCCD (12 số) / CMND (9 số) — đứng riêng, không dính số khác
+    ("national_id", re.compile(r"(?<!\d)(?:\d{12}|\d{9})(?!\d)"), REDACTED),
+    # SĐT VN: 0xxxxxxxxx (10–11 số) hoặc +84xxxxxxxxx
+    ("phone", re.compile(r"(?<![\d+])(?:\+84|0)\d{9,10}(?!\d)"), REDACTED),
+    # Host nội bộ: *.internal (có thể kèm :port)
+    ("internal_host", re.compile(r"\b[\w-]+(?:\.[\w-]+)*\.internal(?::\d+)?\b", re.IGNORECASE), REDACTED),
+]
+
+
 def content_filter(response: str) -> dict:
     """Filter response for PII, secrets, and harmful content.
 
@@ -37,23 +65,23 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
-    redacted = response
+    redacted = response or ""
 
-    # PII patterns to check
-    PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
-    }
-
-    for name, pattern in PII_PATTERNS.items():
-        matches = re.findall(pattern, response, re.IGNORECASE)
+    # Thứ tự quan trọng: secret dài/cụ thể (api_key, password) che TRƯỚC,
+    # số điện thoại / CCCD che SAU để không "ăn" nhầm một phần của secret.
+    for name, pattern, replacement in PII_PATTERNS:
+        matches = pattern.findall(redacted)
         if matches:
             issues.append(f"{name}: {len(matches)} found")
-            redacted = re.sub(pattern, "[REDACTED]", redacted, flags=re.IGNORECASE)
+            redacted = pattern.sub(replacement, redacted)
+
+    # Lớp cuối: secret nội bộ biết trước (data/protected/vinbank_secrets.json)
+    # — bắt cả khi model nhắc tới mà không có chữ "password"/"sk-" đi kèm.
+    leaked = [s for s in DEMO_SECRETS if s.lower() in redacted.lower()]
+    if leaked:
+        issues.append(f"internal_secret: {len(leaked)} found")
+        for secret in sorted(leaked, key=len, reverse=True):
+            redacted = re.sub(re.escape(secret), REDACTED, redacted, flags=re.IGNORECASE)
 
     return {
         "safe": len(issues) == 0,
@@ -140,6 +168,20 @@ async def llm_safety_check(response_text: str) -> dict:
 #   - Return the (possibly modified) llm_response, or None to keep original
 # ============================================================
 
+# Loại issue coi là "secret nội bộ" -> chặn cả câu thay vì chỉ redact.
+SECRET_ISSUE_TYPES = {"api_key", "password", "internal_host", "internal_secret"}
+
+# Câu thay thế cố định (khớp marker output_filter trong attacks.py).
+OUTPUT_BLOCK_MESSAGE = (
+    "I cannot share internal system details. "
+    "How else can I help with your VinBank account or banking needs?"
+)
+JUDGE_BLOCK_MESSAGE = (
+    "I'm sorry, I can't provide that response. "
+    "Please contact VinBank support for further assistance."
+)
+
+
 class OutputGuardrailPlugin(base_plugin.BasePlugin):
     """Plugin that checks agent output before sending to user."""
 
@@ -149,6 +191,11 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         self.blocked_count = 0
         self.redacted_count = 0
         self.total_count = 0
+
+    @staticmethod
+    def _make_content(text: str) -> types.Content:
+        """Đóng gói text thành Content để thay vào llm_response."""
+        return types.Content(role="model", parts=[types.Part.from_text(text=text)])
 
     def _extract_text(self, llm_response) -> str:
         """Extract text from LLM response."""
@@ -172,16 +219,32 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Regex filter (PII + secret)
+        result = content_filter(response_text)
+        if not result["safe"]:
+            issue_types = {issue.split(":", 1)[0] for issue in result["issues"]}
 
-        return llm_response  # TODO: modify if needed
+            if issue_types & SECRET_ISSUE_TYPES:
+                # Lộ secret nội bộ -> CHẶN cả câu (fail-closed). Không trả bản
+                # redact vì phần còn lại vẫn có thể chứa gợi ý / bản mã hoá.
+                self.blocked_count += 1
+                llm_response.content = self._make_content(OUTPUT_BLOCK_MESSAGE)
+                return llm_response
+
+            # Chỉ có PII (SĐT, email, CCCD) -> che phần nhạy cảm, giữ câu trả lời
+            self.redacted_count += 1
+            llm_response.content = self._make_content(result["redacted"])
+            response_text = result["redacted"]
+
+        # 2. (Optional) LLM-as-Judge — chỉ chạy khi đã khởi tạo judge
+        if self.use_llm_judge:
+            verdict = await llm_safety_check(response_text)
+            if not verdict["safe"]:
+                self.blocked_count += 1
+                llm_response.content = self._make_content(JUDGE_BLOCK_MESSAGE)
+
+        # 3. Trả response (có thể đã bị sửa)
+        return llm_response
 
 
 # ============================================================
